@@ -195,8 +195,8 @@ def cleanup():
     curses.curs_set(1)
     curses.endwin()
 
-    print w_str.rstrip()
-    print
+    print(w_str.rstrip())
+    print()
 
     mixer.quit()
 
@@ -245,8 +245,8 @@ if __name__ == "__main__":
             curses.curs_set(1)
             curses.endwin()
 
-            print w_str.rstrip()
-            print
+            print(w_str.rstrip())
+            print()
 
             sys.exit()
 
