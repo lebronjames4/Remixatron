@@ -1,10 +1,10 @@
-""" Classes for remixing audio files.
+""" Remixatron - Classes for remixing audio files.
 
 (c) 2017 - Dave Rensin - dave@rensin.com
 
 This module contains classes for remixing audio files. It started
 as an attempt to re-create the amazing Infinite Jukebox (http://www.infinitejuke.com)
-created by Paul Lamere of Echo Nest.
+created by Paul Lemere of Echo Nest.
 
 The InfiniteJukebox class can do it's processing in a background thread and
 reports progress via the progress_callback arg. To run in a thread, pass async=True
@@ -35,16 +35,21 @@ be signaled when the processing is complete. The default mode is to run synchron
 import collections
 import librosa
 import math
+import pygame
 import random
 import scipy
+import sys
 import threading
+
+from operator import itemgetter, attrgetter
+from pygame import mixer
 
 import numpy as np
 import sklearn.cluster
 
 class InfiniteJukebox(object):
 
-    """ Class to "infinitely" remix a song.
+    """ InfiniteJukebox - class to "infinitely" remix a song.
 
     This class will take an audio file (wav, mp3, ogg, etc) and
     (a) decompose it into individual beats, (b) find the tempo
@@ -68,7 +73,7 @@ class InfiniteJukebox(object):
                  or similar modules. If the audio is mono then the shape of the array will
                  be (bytes,). If it's stereo, then the shape will be (2,bytes).
 
-    sample_rate: the sample rate from the audio file. Usually 44100 or 48000
+    sample_rate: the sample rate from the audio file. Usually 44100
 
        clusters: the number of clusters used to group the beats. If you pass in a value, then
                  this will be reflected here. If you let the algorithm decide, then auto-generated
@@ -77,37 +82,30 @@ class InfiniteJukebox(object):
           beats: a dictionary containing the individual beats of the song in normal order. Each
                  beat will have the following keys:
 
-                         id: the ordinal position of the beat in the song
-                      start: the time (in seconds) in the song where this beat occurs
-                   duration: the duration (in seconds) of the beat
-                     buffer: an array of audio bytes for this beat. it is just raw_audio[start:start+duration]
-                    cluster: the cluster that this beat most closely belongs. Beats in the same cluster
-                             have similar harmonic (timbre) and chromatic (pitch) characteristics. They
-                             will "sound similar"
-                    segment: the segment to which this beat belongs. A 'segment' is a contiguous block of
-                             beats that belong to the same cluster.
-                  amplitude: the loudness of the beat
-                       next: the next beat to play after this one, if playing sequentially
-            jump_candidates: a list of the other beats in the song to which it is reasonable to jump. Those beats
-                             (a) are in the same cluster as the NEXT oridnal beat, (b) are of the same segment position
-                             as the next ordinal beat, (c) are in the same place in the measure as the NEXT beat,
-                             (d) but AREN'T the next beat.
+                     id: the ordinal position of the beat in the song
+                  start: the time (in seconds) in the song where this beat occurs
+               duration: the duration (in seconds) of the beat
+                 buffer: an array of audio bytes for this beat. it is just raw_audio[start:start+duration]
+                segment: the cluster that this beat most closely belongs. Beats in the same segment
+                         have similar harmonic (timbre) and chromatic (pitch) characteristics. They
+                         will "sound similar"
+              amplitude: the loudness of the beat
 
-                 An example of playing the first 32 beats of a song:
+                         An example of playing the first 32 beats of a song:
 
-                    from Remixatron import InfiniteJukebox
-                    from pygame import mixer
-                    import time
+                            from Remixatron import InfiniteJukebox
+                            from pygame import mixer
+                            import time
 
-                    jukebox = InfiniteJukebox('some_file.mp3')
+                            jukebox = InfiniteJukebox('some_file.mp3')
 
-                    pygame.mixer.init(frequency=jukebox.sample_rate)
-                    channel = pygame.mixer.Channel(0)
+                            pygame.mixer.init(frequency=jukebox.sample_rate)
+                            channel = pygame.mixer.Channel(0)
 
-                    for beat in jukebox.beats[0:32]:
-                        snd = pygame.Sound(buffer=beat['buffer'])
-                        channel.queue(snd)
-                        time.sleep(beat['duration'])
+                            for beat in jukebox.beats[0:32]:
+                                snd = pygame.Sound(buffer=beat['buffer'])
+                                channel.queue(snd)
+                                time.sleep(beat['duration'])
 
     play_vector: a beat play list of 1024^2 items. This represents a pre-computed
                  remix of this song that will last beat['duration'] * 1024 * 1024
@@ -149,7 +147,6 @@ class InfiniteJukebox(object):
         self.__filename = filename
         self.__start_beat = start_beat
         self.clusters = clusters
-        self._extra_diag = ""
 
         if async == True:
             self.play_ready = threading.Event()
@@ -180,8 +177,8 @@ class InfiniteJukebox(object):
         # trim the silences from each end
         #
 
-        y, sr = librosa.core.load(self.__filename, mono=False, sr=None)
-        y, _ = librosa.effects.trim(y)
+        y, sr = librosa.core.load(self.__filename, mono=False, sr=44100)
+        y, index = librosa.effects.trim(y)
 
         self.duration = librosa.core.get_duration(y,sr)
         self.raw_audio = (y * np.iinfo(np.int16).max).astype(np.int16).T.copy(order='C')
@@ -265,7 +262,7 @@ class InfiniteJukebox(object):
 
 
         # and its spectral decomposition
-        _, evecs = scipy.linalg.eigh(L)
+        evals, evecs = scipy.linalg.eigh(L)
 
 
         # We can clean this up further with a median filter.
@@ -282,6 +279,7 @@ class InfiniteJukebox(object):
         self.__report_progress( .5, "clustering..." )
 
         if self.clusters == 0:
+#            self.clusters = int(round(self.tempo / 7))
             self.clusters, seg_ids = self.__compute_best_cluster(evecs, Cnorm)
 
         else:
@@ -298,6 +296,26 @@ class InfiniteJukebox(object):
 
         self.__report_progress( .51, "using %d clusters" % self.clusters )
 
+        ###############################################################
+        # Locate segment boundaries from the label sequence
+        bound_beats = 1 + np.flatnonzero(seg_ids[:-1] != seg_ids[1:])
+
+        # Count beat 0 as a boundary
+        bound_beats = librosa.util.fix_frames(bound_beats, x_min=0)
+
+        # Compute the segment label for each boundary
+        bound_segs = list(seg_ids[bound_beats])
+
+        # Convert beat indices to frames
+        bound_frames = beats[bound_beats]
+
+        # Make sure we cover to the end of the track
+        bound_frames = librosa.util.fix_frames(bound_frames,
+                                               x_min=None,
+                                               x_max=C.shape[1]-1)
+
+        bound_times = librosa.frames_to_time(bound_frames)
+
         # Get the amplitudes and beat-align them
         self.__report_progress( .6, "getting amplitudes" )
         amplitudes = librosa.feature.rmse(y=y)
@@ -312,26 +330,11 @@ class InfiniteJukebox(object):
 
         bytes_per_second = int(round(len(self.raw_audio) / self.duration))
 
-        last_cluster = -1
-        current_segment = -1
-        segment_beat = 0
-
         for i in range(0, len(beat_tuples)):
             final_beat = {}
             final_beat['start'] = float(beat_tuples[i][1])
-            final_beat['cluster'] = int(beat_tuples[i][2])
+            final_beat['segment'] = int(beat_tuples[i][2])
             final_beat['amplitude'] = float(beat_tuples[i][3])
-
-            if final_beat['cluster'] != last_cluster:
-                current_segment += 1
-                segment_beat = 0
-            else:
-                segment_beat += 1
-
-            final_beat['segment'] = current_segment
-            final_beat['is'] = segment_beat
-
-            last_cluster = final_beat['cluster']
 
             if i == len(beat_tuples) - 1:
                 final_beat['duration'] = self.duration - final_beat['start']
@@ -345,97 +348,67 @@ class InfiniteJukebox(object):
 
             final_beat['stop_index'] = int(math.ceil((final_beat['start'] + final_beat['duration']) * bytes_per_second))
 
-            # save pointers to the raw bytes for each beat with each beat.
-            final_beat['buffer'] = self.raw_audio[ final_beat['start_index'] : final_beat['stop_index'] ]
-
             info.append(final_beat)
 
-            self.__report_progress( .7, "truncating to fade point..." )
+        self.__report_progress( .7, "truncating to fade point..." )
 
+        # get the mean amplitude of the beats
+        avg_amplitude = np.mean([b['amplitude'] for b in info])
 
-        # get the max amplitude of the beats
-        max_amplitude = max([float(b['amplitude']) for b in info])
+        # assume that the fade point of the song is the beat that (a) is after 90% of the song and (b) has
+        # an amplitude of <= 50% of the mean. For songs that have 'button' endings, just return the last
+        # beat
+        fade = next( (b for b in info[int(len(info) * .9):] if b['amplitude'] <= (.5 * avg_amplitude)), info[-1] )
 
-        # assume that the fade point of the song is the last beat of the song that is >= 75% of
-        # the max amplitude.
+        # truncate the beats to [start:fade]
+        beats = info[self.__start_beat:info.index(fade)]
 
-        self.max_amplitude = max_amplitude
+        # truncate the beats so that they are a multiple of 4. The vast majority of songs will
+        # have 4 beats per measure and doing this will make looping from the end of the song
+        # into some other place sound more natural
 
-        fade = next(info.index(b) for b in reversed(info) if b['amplitude'] >= (.75 * max_amplitude))
+        if ( fade != info[-1] and len(beats) % 4 != 0 ):
+            beats = beats[:(len(beats) % 4) * -1]
 
-        # truncate the beats to [start:fade + 1]
-        beats = info[self.__start_beat:fade + 1]
+        # nearly all songs have an intro that should be discarded during the jump calculations because
+        # landing there will sound stilted. This line finds the first beat of the 2nd segment in the song
+        loop_bounds_begin = beats.index(next(b for b in beats if b['segment'] != beats[0]['segment']))
 
-        loop_bounds_begin = self.__start_beat
+        # if start_beat has been passed in, then use the max(start_beat, loop_bounds_begin) as the earliest
+        # allowed jump point in the song
+        loop_bounds_begin = max(loop_bounds_begin, self.__start_beat)
+
+        # save pointers to the raw bytes for each beat with each beat.
+        # This makes playback code easier. Also compute a coherent 'next'
+        # beats to play
+
+        last_segment = -1
+        segment_beat = 0
 
         self.__report_progress( .8, "computing final beat array..." )
 
-        # assign final beat ids
         for beat in beats:
             beat['id'] = beats.index(beat)
-            beat['quartile'] = beat['id'] // (len(beats) / 4.0)
+            beat['buffer'] = self.raw_audio[ beat['start_index'] : beat['stop_index'] ]
 
-        # compute a coherent 'next' beat to play. This is always just the next ordinal beat
-        # unless we're at the end of the song. Then it gets a little trickier.
+            if beat['segment'] != last_segment:
+                segment_beat = 0
+                last_segment = beat['segment']
 
-        for beat in beats:
+            beat['is'] = segment_beat
+
+            segment_beat += 1
+
             if beat == beats[-1]:
 
                 # if we're at the last beat, then we want to find a reasonable 'next' beat to play. It should (a) share the
-                # same cluster, (b) be in a logical place in its measure, (c) be after the computed loop_bounds_begin, and
-                # is in the first half of the song. If we can't find such an animal, then just return the beat
-                # at loop_bounds_begin
+                # same segment, (b) be not closer than 64 beats to the current beat, and (c) be after the computed loop_bounds_begin.
+                # If we can't find such an animal, then just return the beat at loop_bounds_begin
 
-                beat['next'] = next( (b['id'] for b in beats if b['cluster'] == beat['cluster'] and
-                                      b['id'] % 4 == (beat['id'] + 1) % 4 and
-                                      b['id'] <= (.5 * len(beats)) and
-                                      b['id'] >= loop_bounds_begin), loop_bounds_begin )
+                beat['next'] = next( (b['id'] for b in beats if b['segment'] == beat['segment'] and b['id'] <= (beat['id'] - 64) and b['id'] >= loop_bounds_begin), loop_bounds_begin )
             else:
-                beat['next'] = beat['id'] + 1
+                beat['next'] = beats.index(beat) + 1
 
-            # find all the beats that (a) are in the same cluster as the NEXT oridnal beat, (b) are of the same
-            # cluster position as the next ordinal beat, (c) are in the same place in the measure as the NEXT beat,
-            # (d) but AREN'T the next beat, and (e) AREN'T in the same cluster as the current beat.
-            #
-            # THAT collection of beats contains our jump candidates
-
-            jump_candidates = [bx['id'] for bx in beats[loop_bounds_begin:] if
-                               (bx['cluster'] == beats[beat['next']]['cluster']) and
-                               (bx['is'] == beats[beat['next']]['is']) and
-                               (bx['id'] % 4 == beats[beat['next']]['id'] % 4) and
-                               (bx['segment'] != beat['segment']) and
-                               (bx['id'] != beat['next'])]
-
-            if jump_candidates:
-                beat['jump_candidates'] = jump_candidates
-            else:
-                beat['jump_candidates'] = []
-
-        # safe off the segment count
-        self.segments = max([b['segment'] for b in beats]) + 1
-
-        # we don't want to ever play past the point where it's impossible to loop,
-        # so let's find the latest point in the song where there are still jump
-        # candidates and make sure that we can't play past it.
-
-        last_chance = next(beats.index(b) for b in reversed(beats) if len(b['jump_candidates']) > 0)
-
-        # if we play our way to the last beat that has jump candidates, then just skip
-        # to the earliest jump candidate rather than enter a section from which no
-        # jumping is possible.
-
-        beats[last_chance]['next'] = min(beats[last_chance]['jump_candidates'])
-
-        # store the beats that start after the last jumpable point. That's
-        # the outro to the song. We can use these
-        # beasts to create a sane ending for a fixed-length remix
-
-        outro_start = last_chance + 1 + self.__start_beat
-
-        if outro_start >= len(info):
-            self.outro = []
-        else:
-            self.outro = info[outro_start:]
 
         #
         # This section of the code computes the play_vector -- a 1024*1024 beat length
@@ -443,16 +416,7 @@ class InfiniteJukebox(object):
         #
 
         random.seed()
-
-        # how long should our longest contiguous playback blocks be? One way to
-        # consider it is that higher bpm songs need longer blocks because
-        # each beat takes less time. A simple way to estimate a good value
-        # is to scale it by it's distance from 120bpm -- the canonical bpm
-        # for popular music.
-
-        max_sequence_len = int(round((self.tempo / 120.0) * 32.0))
-        min_sequence = max(random.randrange(8, max_sequence_len, 4), loop_bounds_begin)
-
+        min_sequence = random.randrange(32,48,8)
         current_sequence = 0
         beat = beats[0]
 
@@ -462,148 +426,70 @@ class InfiniteJukebox(object):
 
         play_vector.append( {'beat':0, 'seq_len':min_sequence, 'seq_pos':current_sequence} )
 
-        # we want to keep a list of recently played segments so we don't accidentally wind up in a local loop
-        #
-        # the number of segments in a song will vary so we want to set the number of recents to keep
-        # at 25% of the total number of segments. Eg: if there are 34 segments, then the depth will
-        # be set at round(8.5) == 9.
-        #
-        # On the off chance that the (# of segments) *.25 < 1 we set a floor queue depth of 1
+        # we want to keep a list of the 5 most recent jump points
+        # so we don't accidentally wind up in a local loop
 
-        recent_depth = int(round(self.segments * .25))
-        recent_depth = max( recent_depth, 1 )
-
-        recent = collections.deque(maxlen=recent_depth)
-
-        # keep track of the time since the last successful jump. If we go more than
-        # 10% of the song length since our last jump, then we will prioritize an
-        # immediate jump to a not recently played segment. Otherwise playback will
-        # be boring for the listener. This also has the advantage of busting out of
-        # local loops.
-
-        max_beats_between_jumps = int(round(len(beats) * .1))
-        beats_since_jump = 0
-        failed_jumps = 0
+        recent = collections.deque(maxlen=5)
+        recent.append(0)
 
         for i in range(0, 1024 * 1024):
 
-            if beat['segment'] not in recent:
-                recent.append(beat['segment'])
-
             current_sequence += 1
 
-            # it's time to attempt a jump if we've played all the beats we wanted in the
-            # current sequence. Also, if we've gone more than 10% of the length of the song
-            # without jumping we need to immediately prioritze jumping to a non-recent segment.
+            will_jump = current_sequence >= min_sequence
 
-            will_jump = (current_sequence == min_sequence) or (beats_since_jump >= max_beats_between_jumps)
-
-            # since it's time to jump, let's find the most musically pleasing place
-            # to go
+            # if it's time to jump, then assign the next beat, and create
+            # a new play sequence between 8 and 48 beats -- making sure
+            # that the new sequence is always modulo 4.
 
             if ( will_jump ):
 
-                # find the jump candidates that haven't been recently played
-                non_recent_candidates = [c for c in beat['jump_candidates'] if beats[c]['segment'] not in recent]
+                # find all the beats that (a) are in the same cluster as the NEXT oridnal beat, (b) are of the same
+                # segment position as the next ordinal beat, (c) haven't recently been used as a jump point,
+                # and (d) are at least 16 beats from the current beat.
+                #
+                # THAT collection of beats contains our jump candidates
 
-                # if there aren't any good jump candidates, then we need to fall back
-                # to another selection scheme.
+                jump_candidates = [bx['id'] for bx in beats[loop_bounds_begin:] if
+                                   (bx['segment'] == beats[beat['next']]['segment']) and
+                                   (bx['is'] == beats[beat['next']]['is']) and
+                                   (bx['id'] % 4 == beats[beat['next']]['id'] % 4) and
+                                   (bx['id'] not in recent) and
+                                   (abs(bx['id'] - beat['id']) >= 16)]
 
-                if len(non_recent_candidates) == 0:
+                # if we can't find one that meets those conditions, just target the next ordinal beat. This is
+                # a failsafe that in practice should very rarely be needed. Otherwise, just pick a random beat from
+                # the computed candidates
 
-                    beats_since_jump += 1
-                    failed_jumps += 1
-
-                    # suppose we've been trying to jump but couldn't find a good non-recent candidate. If
-                    # the length of time we've been trying (and failing) is >= 10% of the song length
-                    # then it's time to relax our criteria. Let's find the jump candidate that's furthest
-                    # from the current beat (irrespective if it's been played recently) and go there. Ideally
-                    # we'd like to jump to a beat that is not in the same quartile of the song as the currently
-                    # playing section. That way we maximize our chances of avoiding a long local loop -- such as
-                    # might be found in the section preceeding the outro of a song.
-
-                    non_quartile_candidates = [c for c in beat['jump_candidates'] if beats[c]['quartile'] != beat['quartile']]
-
-                    if (failed_jumps >= (.1 * len(beats))) and (len(non_quartile_candidates) > 0):
-
-                        furthest_distance = max([abs(beat['id'] - c) for c in non_quartile_candidates])
-
-                        jump_to = next(c for c in non_quartile_candidates
-                                       if abs(beat['id'] - c) == furthest_distance)
-
-                        beat = beats[jump_to]
-                        beats_since_jump = 0
-                        failed_jumps = 0
-
-                    # uh oh! That fallback hasn't worked for yet ANOTHER 10%
-                    # of the song length. Something is seriously broken. Time
-                    # to punt and just start again from the first beat.
-
-                    elif failed_jumps >= (.2 * len(beats)):
-                        beats_since_jump = 0
-                        failed_jumps = 0
-                        beat = beats[loop_bounds_begin]
-
-                    # asuuming we're not in one of the failure modes but haven't found a good
-                    # candidate that hasn't been recently played, just play the next beat in the
-                    # sequence
-
-                    else:
-                        beat = beats[beat['next']]
-
+                if len(jump_candidates) == 0:
+                    beat = beats[ beat['next'] ]
                 else:
-
-                    # if it's time to jump and we have at least one good non-recent
-                    # candidate, let's just pick randomly from the list and go there
-
-                    beats_since_jump = 0
-                    failed_jumps = 0
-                    beat = beats[ random.choice(non_recent_candidates) ]
-
-                # reset our sequence position counter and pick a new target length
-                # between 8 and max_sequence_len, making sure it's evenly divisible by
-                # 4 beats
+                    beat = beats[ random.choice(jump_candidates) ]
+                    recent.append(beat['id'])
 
                 current_sequence = 0
-                min_sequence = random.randrange(8, max_sequence_len, 4)
+#                min_sequence = random.randrange(8,32,4)
+                min_sequence = random.randrange(8,32)
 
-                # if we're in the place where we want to jump but can't because
-                # we haven't found any good candidates, then set current_sequence equal to
-                # min_sequence. During playback this will show up as having 00 beats remaining
-                # until we next jump. That's the signal that we'll jump as soon as we possibly can.
-                #
-                # Code that reads play_vector and sees this value can choose to visualize this in some
-                # interesting way.
-
-                if beats_since_jump >= max_beats_between_jumps:
-                    current_sequence = min_sequence
-
-                # add an entry to the play_vector
                 play_vector.append({'beat':beat['id'], 'seq_len': min_sequence, 'seq_pos': current_sequence})
             else:
-
-                # if we're not trying to jump then just add the next item to the play_vector
                 play_vector.append({'beat':beat['next'], 'seq_len': min_sequence, 'seq_pos': current_sequence})
                 beat = beats[beat['next']]
-                beats_since_jump += 1
 
-        # save off the beats array and play_vector. Signal
-        # the play_ready event (if it's been set)
+        self.__report_progress(1.0, "ready")
 
         self.beats = beats
         self.play_vector = play_vector
-
-        self.__report_progress(1.0, "ready")
 
         if self.play_ready:
             self.play_ready.set()
 
     def __report_progress(self, pct_done, message):
 
-        """ If a reporting callback was passed, call it in order
+        """ If a reporting callback was passed, call it in oder
             to mark progress.
         """
-        if self.__progress_callback:
+        if self.__progress_callback != None:
             self.__progress_callback( pct_done, message )
 
     def __compute_best_cluster(self, evecs, Cnorm):
@@ -620,21 +506,20 @@ class InfiniteJukebox(object):
 
             KEY DEFINITIONS:
 
-                Clusters: buckets of musical similarity
+                 Cluster: buckets of musical similarity
                 Segments: contiguous blocks of beats belonging to the same cluster
                  Orphans: clusters that only belong to one segment
-                    Stub: a cluster with less than N beats. Stubs are a sign of
+                    Stub: a segment with less than N beats. Stubs are a sign of
                           overfitting
 
             SUMMARY:
 
-                Group the beats in [8..64] clusters. They key metric is the segment:cluster ratio.
-                This value gives the avg number of different segments to which a cluster
-                might belong. The higher the value, the more diverse the playback because
-                the track can jump more freely. There is a balance, however, between this
-                ratio and the number of clusters. In general, we want to find the highest
-                numeric cluster that has a ratio of segments:clusters nearest 4.
-                That ratio produces the most musically pleasing results.
+                Group the beats in [2..48] clusters. Compute the average number of
+                orphans in each of the 47 computed clusterings. We want to find the
+                right cluster size (2..48) that will give us the highest possiblity
+                of smoothly jumping around but without being too promiscuous. The way
+                we do that is to find the highest cluster value (2..48) that has an
+                average orphan count <= the global average orphan count AND has no stub segments.
 
                 Basically, we're looking for the highest possible cluster # that doesn't
                 obviously overfit.
@@ -644,11 +529,7 @@ class InfiniteJukebox(object):
 
         self._clusters_list = []
 
-        # We compute the clusters between 4 and 50. Owing to the inherent
-        # symmetry of Western popular music (including Jazz and Classical), the most
-        # pleasing musical results will often, though not always, come from even cluster values.
-
-        for ki in range(4,51):
+        for ki in range(2,49):
 
             # compute a matrix of the Eigen-vectors / their normalized values
             X = evecs[:, :ki] / Cnorm[:, ki-1:ki]
@@ -677,27 +558,28 @@ class InfiniteJukebox(object):
 
                 lst[l]['beats'] += 1
 
-            entry['cluster_map'] = lst
+            entry['segment_map'] = lst
 
-            # get the average number of segments to which a cluster belongs
-            entry['seg_ratio'] = np.mean([l['segs'] for l in entry['cluster_map']])
+            # get a list of clusters that only appear in 1 segment. Those are orphans.
+            entry['orphans'] = [l['label'] for l in entry['segment_map'] if l['segs'] == 1]
+
+            # across all the clusters, get the avg number of orphans per cluster
+            # ie: the % of clusters that appear in only 1 segment
+            entry['avg_orphans'] = len(entry['orphans']) / float(entry['clusters'])
+
+            # get the list of segments that have less than 6 beats. Those are stubs
+            entry['stubs'] = len( [l for l in entry['segment_map'] if l['beats'] < 6] )
 
             self._clusters_list.append(entry)
 
-        # get the max cluster with the segments/cluster ratio nearest to 4. That
-        # will produce the most musically pleasing effect
+        # compute the average number of orphan clusters across all candidate clusterings
+        avg_orphan_ratio = sum([cl['avg_orphans'] for cl in self._clusters_list]) / len(self._clusters_list)
 
-        max_seg_ratio = max( [cl['seg_ratio'] for cl in self._clusters_list] )
-        max_seg_ratio = min( max_seg_ratio, 4 )
+        # find the candidates that have an average orphan count <= the global average AND have no stubs
+        candidates = [cl['clusters'] for cl in self._clusters_list if cl['avg_orphans'] <= avg_orphan_ratio and cl['stubs'] == 0]
 
-        final_cluster_size = max(cl['clusters'] for cl in self._clusters_list if cl['seg_ratio'] >= max_seg_ratio)
-
-        labels = next(c['labels'] for c in self._clusters_list if c['clusters'] == final_cluster_size)
+        # the winner is the highest cluster size among the candidates
+        final_cluster_size = max(candidates)
 
         # return a tuple of (winning cluster size, [array of cluster labels for the beats])
-        return (final_cluster_size, labels)
-
-    def __add_log(self, line):
-        """Convenience method to add debug logging info for later"""
-
-        self._extra_diag += line + "\n"
+        return (final_cluster_size, next(c['labels'] for c in self._clusters_list if c['clusters'] == final_cluster_size))
