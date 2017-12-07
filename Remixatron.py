@@ -306,7 +306,7 @@ class InfiniteJukebox(object):
         # create a list of tuples that include the ordinal position, the start time of the beat,
         # the cluster to which the beat belongs and the mean amplitude of the beat
 
-        beat_tuples = zip(range(0,len(beats)), beat_times, seg_ids, ampSync[0].tolist())
+        beat_tuples = list(zip(range(0,len(beats)), beat_times, seg_ids, ampSync[0].tolist()))
 
         info = []
 
