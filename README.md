@@ -1,3 +1,6 @@
+# NOTE
+This is a VERY old version of Remixatron that I fixed. The newer versions wouldn't work.
+
 # Remixatron
 (c) 2017 - Dave Rensin - dave@rensin.com
 
